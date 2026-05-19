@@ -69,6 +69,7 @@ Explore::Explore()
   this->declare_parameter<float>("orientation_scale", 0.0);
   this->declare_parameter<float>("gain_scale", 1.0);
   this->declare_parameter<float>("min_frontier_size", 0.5);
+  this->declare_parameter<float>("min_obstacle_distance", 0.75);
   this->declare_parameter<bool>("return_to_init", false);
 
   this->get_parameter("planner_frequency", planner_frequency_);
@@ -78,6 +79,7 @@ Explore::Explore()
   this->get_parameter("orientation_scale", orientation_scale_);
   this->get_parameter("gain_scale", gain_scale_);
   this->get_parameter("min_frontier_size", min_frontier_size);
+  this->get_parameter("min_obstacle_distance", min_obstacle_distance_);
   this->get_parameter("return_to_init", return_to_init_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
 
@@ -262,8 +264,9 @@ void Explore::makePlan()
   auto frontiers = search_.searchFrom(pose.position);
   RCLCPP_INFO(logger_, "found %lu frontiers, robot at (%.2f, %.2f)",
               frontiers.size(), pose.position.x, pose.position.y);
+  RCLCPP_DEBUG(logger_, "--- frontier details ---");
   for (size_t i = 0; i < frontiers.size(); ++i) {
-    RCLCPP_INFO(logger_, "frontier %lu: centroid(%.2f, %.2f) middle(%.2f, %.2f) cost=%.3f min_dist=%.2f size=%u",
+    RCLCPP_DEBUG(logger_, "frontier %lu: centroid(%.2f, %.2f) middle(%.2f, %.2f) cost=%.3f min_dist=%.2f size=%u",
                 i, frontiers[i].centroid.x, frontiers[i].centroid.y,
                 frontiers[i].middle.x, frontiers[i].middle.y,
                 frontiers[i].cost, frontiers[i].min_distance, frontiers[i].size);
@@ -288,7 +291,8 @@ void Explore::makePlan()
       std::find_if_not(frontiers.begin(), frontiers.end(),
                        [this](const frontier_exploration::Frontier& f) {
                          return goalOnBlacklist(f.centroid) ||
-                                f.min_distance < 1.0;
+                                f.min_distance < 1.0 ||
+                                isTooCloseToObstacle(f.middle);
                        });
   if (frontier == frontiers.end()) {
     RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
@@ -372,6 +376,36 @@ bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
     if (x_diff < tolerace * costmap2d->getResolution() &&
         y_diff < tolerace * costmap2d->getResolution())
       return true;
+  }
+  return false;
+}
+
+bool Explore::isTooCloseToObstacle(const geometry_msgs::msg::Point& point)
+{
+  auto* costmap = costmap_client_.getCostmap();
+  unsigned int mx, my;
+  if (!costmap->worldToMap(point.x, point.y, mx, my)) {
+    return true;
+  }
+
+  int cell_radius = static_cast<int>(
+      std::ceil(min_obstacle_distance_ / costmap->getResolution()));
+  int size_x = static_cast<int>(costmap->getSizeInCellsX());
+  int size_y = static_cast<int>(costmap->getSizeInCellsY());
+
+  for (int dx = -cell_radius; dx <= cell_radius; ++dx) {
+    for (int dy = -cell_radius; dy <= cell_radius; ++dy) {
+      if (dx * dx + dy * dy > cell_radius * cell_radius) continue;
+
+      int nx = static_cast<int>(mx) + dx;
+      int ny = static_cast<int>(my) + dy;
+      if (nx < 0 || ny < 0 || nx >= size_x || ny >= size_y) continue;
+
+      unsigned char cost = costmap->getCost(nx, ny);
+      if (cost == nav2_costmap_2d::LETHAL_OBSTACLE) {
+        return true;
+      }
+    }
   }
   return false;
 }

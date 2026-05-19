@@ -97,6 +97,7 @@ private:
       const std::vector<frontier_exploration::Frontier>& frontiers);
 
   bool goalOnBlacklist(const geometry_msgs::msg::Point& goal);
+  bool isTooCloseToObstacle(const geometry_msgs::msg::Point& point);
 
   NavigationGoalHandle::SharedPtr navigation_goal_handle_;
   // void
@@ -144,6 +145,7 @@ private:
   double planner_frequency_;
   double potential_scale_, orientation_scale_, gain_scale_;
   double progress_timeout_;
+  double min_obstacle_distance_;
   bool visualize_;
   bool return_to_init_;
   std::string robot_base_frame_;
