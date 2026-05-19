@@ -129,9 +129,13 @@ private:
 
   std::vector<geometry_msgs::msg::Point> frontier_blacklist_;
   geometry_msgs::msg::Point prev_goal_;
+  geometry_msgs::msg::Point prev_centroid_;
   double prev_distance_;
   rclcpp::Time last_progress_;
+  bool progress_initialized_ = false;
   size_t last_markers_count_;
+  int consecutive_aborts_ = 0;
+  static constexpr int kMaxConsecutiveAborts = 20;
 
   geometry_msgs::msg::Pose initial_pose_;
   void returnToInitialPose(void);
@@ -144,6 +148,7 @@ private:
   bool return_to_init_;
   std::string robot_base_frame_;
   bool resuming_ = false;
+  bool navigating_ = false;
 };
 }  // namespace explore
 

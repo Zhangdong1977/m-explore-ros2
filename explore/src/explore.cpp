@@ -46,7 +46,7 @@ inline static bool same_point(const geometry_msgs::msg::Point& one,
   double dx = one.x - two.x;
   double dy = one.y - two.y;
   double dist = sqrt(dx * dx + dy * dy);
-  return dist < 0.01;
+  return dist < 2.0;
 }
 
 namespace explore
@@ -228,13 +228,45 @@ void Explore::visualizeFrontiers(
 
 void Explore::makePlan()
 {
+  // If actively navigating, only check for progress timeout
+  if (navigating_) {
+    auto pose = costmap_client_.getRobotPose();
+    double dx = pose.position.x - prev_goal_.x;
+    double dy = pose.position.y - prev_goal_.y;
+    double current_dist = sqrt(dx * dx + dy * dy);
+
+    // Update progress if robot is getting closer
+    if (current_dist < prev_distance_) {
+      last_progress_ = this->now();
+      prev_distance_ = current_dist;
+    }
+
+    // Timeout: no progress for too long → cancel, blacklist, find new frontier
+    if (progress_initialized_ &&
+        (this->now() - last_progress_ > tf2::durationFromSec(progress_timeout_))) {
+      RCLCPP_WARN(logger_, "No progress for %.1fs, blacklisting (%.2f, %.2f)",
+                  progress_timeout_, prev_goal_.x, prev_goal_.y);
+      move_base_client_->async_cancel_all_goals();
+      frontier_blacklist_.push_back(prev_centroid_);
+      navigating_ = false;
+      progress_initialized_ = false;
+      // Fall through to find a new frontier
+    } else {
+      return;
+    }
+  }
+
   // find frontiers
   auto pose = costmap_client_.getRobotPose();
   // get frontiers sorted according to cost
   auto frontiers = search_.searchFrom(pose.position);
-  RCLCPP_DEBUG(logger_, "found %lu frontiers", frontiers.size());
+  RCLCPP_INFO(logger_, "found %lu frontiers, robot at (%.2f, %.2f)",
+              frontiers.size(), pose.position.x, pose.position.y);
   for (size_t i = 0; i < frontiers.size(); ++i) {
-    RCLCPP_DEBUG(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
+    RCLCPP_INFO(logger_, "frontier %lu: centroid(%.2f, %.2f) middle(%.2f, %.2f) cost=%.3f min_dist=%.2f size=%u",
+                i, frontiers[i].centroid.x, frontiers[i].centroid.y,
+                frontiers[i].middle.x, frontiers[i].middle.y,
+                frontiers[i].cost, frontiers[i].min_distance, frontiers[i].size);
   }
 
   if (frontiers.empty()) {
@@ -251,11 +283,12 @@ void Explore::makePlan()
     visualizeFrontiers(frontiers);
   }
 
-  // find non blacklisted frontier
+  // find non blacklisted frontier with sufficient distance
   auto frontier =
       std::find_if_not(frontiers.begin(), frontiers.end(),
                        [this](const frontier_exploration::Frontier& f) {
-                         return goalOnBlacklist(f.centroid);
+                         return goalOnBlacklist(f.centroid) ||
+                                f.min_distance < 1.0;
                        });
   if (frontier == frontiers.end()) {
     RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
@@ -265,37 +298,23 @@ void Explore::makePlan()
     stop(true);
     return;
   }
-  geometry_msgs::msg::Point target_position = frontier->centroid;
+  geometry_msgs::msg::Point target_position = frontier->middle;
 
-  // time out if we are not making any progress
-  bool same_goal = same_point(prev_goal_, target_position);
-
+  // Set navigation state
   prev_goal_ = target_position;
-  if (!same_goal || prev_distance_ > frontier->min_distance) {
-    // we have different goal or we made some progress
-    last_progress_ = this->now();
-    prev_distance_ = frontier->min_distance;
-  }
-  // black list if we've made no progress for a long time
-  if ((this->now() - last_progress_ >
-      tf2::durationFromSec(progress_timeout_)) && !resuming_) {
-    frontier_blacklist_.push_back(target_position);
-    RCLCPP_DEBUG(logger_, "Adding current goal to black list");
-    makePlan();
-    return;
-  }
+  prev_centroid_ = frontier->centroid;
+  prev_distance_ = frontier->min_distance;
+  last_progress_ = this->now();
+  progress_initialized_ = true;
+  navigating_ = true;
 
   // ensure only first call of makePlan was set resuming to true
   if (resuming_) {
     resuming_ = false;
   }
 
-  // we don't need to do anything if we still pursuing the same goal
-  if (same_goal) {
-    return;
-  }
-
-  RCLCPP_DEBUG(logger_, "Sending goal to move base nav2");
+  RCLCPP_INFO(logger_, "Sending goal to move base nav2: (%.2f, %.2f)",
+              target_position.x, target_position.y);
 
   // send goal to move_base if we have something new to pursue
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
@@ -306,10 +325,6 @@ void Explore::makePlan()
 
   auto send_goal_options =
       rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-  // send_goal_options.goal_response_callback =
-  // std::bind(&Explore::goal_response_callback, this, _1);
-  // send_goal_options.feedback_callback =
-  //   std::bind(&Explore::feedback_callback, this, _1, _2);
   send_goal_options.result_callback =
       [this,
        target_position](const NavigationGoalHandle::WrappedResult& result) {
@@ -346,7 +361,7 @@ void Explore::returnToInitialPose()
 }
 bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
 {
-  constexpr static size_t tolerace = 5;
+  constexpr static size_t tolerace = 40;  // 40 * 0.05 = 2.0m
   nav2_costmap_2d::Costmap2D* costmap2d = costmap_client_.getCostmap();
 
   // check if a goal is on the blacklist for goals that we're pursuing
@@ -364,35 +379,33 @@ bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
 void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
                           const geometry_msgs::msg::Point& frontier_goal)
 {
+  navigating_ = false;
+
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
-      RCLCPP_DEBUG(logger_, "Goal was successful");
+      RCLCPP_INFO(logger_, "Goal was successful");
+      consecutive_aborts_ = 0;
+      frontier_blacklist_.push_back(prev_centroid_);
       break;
     case rclcpp_action::ResultCode::ABORTED:
-      RCLCPP_DEBUG(logger_, "Goal was aborted");
-      frontier_blacklist_.push_back(frontier_goal);
-      RCLCPP_DEBUG(logger_, "Adding current goal to black list");
-      // If it was aborted probably because we've found another frontier goal,
-      // so just return and don't make plan again
+      consecutive_aborts_++;
+      RCLCPP_INFO(logger_, "Goal was aborted (abort #%d)", consecutive_aborts_);
+      if (consecutive_aborts_ >= kMaxConsecutiveAborts) {
+        frontier_blacklist_.push_back(frontier_goal);
+        RCLCPP_WARN(logger_, "Goal aborted %d times consecutively, blacklisting",
+                    consecutive_aborts_);
+        consecutive_aborts_ = 0;
+      }
+      // Return without making a new plan — timer will handle it
       return;
     case rclcpp_action::ResultCode::CANCELED:
       RCLCPP_DEBUG(logger_, "Goal was canceled");
-      // If goal canceled might be because exploration stopped from topic. Don't make new plan.
+      consecutive_aborts_ = 0;
       return;
     default:
       RCLCPP_WARN(logger_, "Unknown result code from move base nav2");
       break;
   }
-  // find new goal immediately regardless of planning frequency.
-  // execute via timer to prevent dead lock in move_base_client (this is
-  // callback for sendGoal, which is called in makePlan). the timer must live
-  // until callback is executed.
-  // oneshot_ = relative_nh_.createTimer(
-  //     ros::Duration(0, 0), [this](const ros::TimerEvent&) { makePlan(); },
-  //     true);
-
-  // Because of the 1-thread-executor nature of ros2 I think timer is not
-  // needed.
   makePlan();
 }
 
@@ -407,6 +420,7 @@ void Explore::start()
 void Explore::stop(bool finished_exploring)
 {
   RCLCPP_INFO(logger_, "Exploration stopped.");
+  navigating_ = false;
 
   // Only publish paused status if manually stopped (not finished exploring)
   if (!finished_exploring) {
